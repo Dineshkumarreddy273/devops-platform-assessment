@@ -18,7 +18,7 @@ variable "image" {
 variable "runtime_service_account_email" {
   type        = string
   description = "Dedicated service account for Cloud Run runtime."
-  default     = "empirical-radio-340813-compute@developer.gserviceaccount.com"
+  default     = "github-deployer-sa@empirical-radio-340813.iam.gserviceaccount.com"
 }
 
 variable "cpu" {
