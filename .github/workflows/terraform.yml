@@ -1,0 +1,102 @@
+name: Terraform Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+      action:
+        description: "Terraform action to execute"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+      image_tag:
+        description: "Image tag or digest to deploy (blank uses variables.tf default)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: "empirical-radio-340813"
+  REGION: "us-central1"
+  AR_REPOSITORY: "optum-repo"
+  IMAGE_NAME: "flask-app"
+
+jobs:
+  validate-and-test:
+    name: Terraform Static Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Format Check
+        run: terraform -chdir="terraform/environments/${{ inputs.environment }}" fmt -check -recursive
+
+      - name: Offline Init & Validate
+        run: |
+          terraform -chdir="terraform/environments/${{ inputs.environment }}" init -backend=false
+          terraform -chdir="terraform/environments/${{ inputs.environment }}" validate
+
+      - name: Run Terraform Unit Tests
+        run: terraform -chdir="terraform/environments/${{ inputs.environment }}" test
+
+  execute:
+    name: Terraform Execute (${{ inputs.action }} on ${{ inputs.environment }})
+    needs: validate-and-test
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'dev' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform Init (Remote GCS Backend)
+        run: terraform -chdir="terraform/environments/${{ inputs.environment }}" init
+
+      - name: Set Image Parameter
+        id: img
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "var_flag=-var=image=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "var_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Terraform Plan
+        if: inputs.action == 'plan'
+        run: |
+          terraform -chdir="terraform/environments/${{ inputs.environment }}" plan ${{ steps.img.outputs.var_flag }}
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        run: |
+          terraform -chdir="terraform/environments/${{ inputs.environment }}" apply -auto-approve ${{ steps.img.outputs.var_flag }}
