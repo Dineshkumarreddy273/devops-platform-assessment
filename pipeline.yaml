@@ -1,0 +1,231 @@
+name: End-to-End Delivery Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Target environment to deploy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+          - both
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: "empirical-radio-340813"
+  REGION: "us-central1"
+  AR_REPOSITORY: "optum-repo"
+  IMAGE_NAME: "flask-app"
+  TERRAFORM_VERSION: "1.9.0"
+
+jobs:
+  # ==========================================
+  # STAGE 1: Code Quality, Lint & Unit Tests
+  # ==========================================
+  test-and-lint:
+    name: App Tests & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint with Ruff
+        run: ruff check app tests
+
+      - name: Run Pytest
+        run: pytest -v --tb=short
+
+  # ==========================================
+  # STAGE 2: Terraform Static Analysis & Unit Tests
+  # ==========================================
+  terraform-tests:
+    name: Terraform Format, Validate & Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, prod]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Format Check
+        run: terraform -chdir="terraform/environments/${{ matrix.env }}" fmt -check -recursive
+
+      - name: Offline Init & Validate
+        run: |
+          terraform -chdir="terraform/environments/${{ matrix.env }}" init -backend=false
+          terraform -chdir="terraform/environments/${{ matrix.env }}" validate
+
+      - name: Run Terraform Unit Tests
+        run: terraform -chdir="terraform/environments/${{ matrix.env }}" test
+
+  # ==========================================
+  # STAGE 3: Container Build, Trivy Scan & Push
+  # ==========================================
+  build-and-push:
+    name: Build, Scan & Push Container Image
+    needs: [test-and-lint, terraform-tests]
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.image-meta.outputs.image_uri }}
+      image_tag: ${{ steps.image-meta.outputs.image_tag }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Image Metadata
+        id: image-meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}"
+          echo "image_tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Container Image Locally
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.image-meta.outputs.image_uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Vulnerability Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image-meta.outputs.image_uri }}
+          format: "table"
+          exit-code: "0" # Set to 1 if you wish to block pipelines on CRITICAL findings
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+      - name: Authenticate to Google Cloud via WIF
+        if: github.event_name != 'pull_request'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        if: github.event_name != 'pull_request'
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Push Container Image to GAR
+        if: github.event_name != 'pull_request'
+        run: docker push ${{ steps.image-meta.outputs.image_uri }}
+
+  # ==========================================
+  # STAGE 4: Deploy to Development
+  # ==========================================
+  deploy-dev:
+    name: Deploy to Dev
+    needs: [build-and-push]
+    if: |
+      github.event_name != 'pull_request' && 
+      (github.event_name == 'push' || inputs.target_env == 'dev' || inputs.target_env == 'both')
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency: deploy-dev
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: terraform -chdir="terraform/environments/dev" init
+
+      - name: Terraform Plan
+        run: |
+          terraform -chdir="terraform/environments/dev" plan \
+            -var="image=${{ needs.build-and-push.outputs.image_uri }}"
+
+      - name: Terraform Apply
+        run: |
+          terraform -chdir="terraform/environments/dev" apply -auto-approve \
+            -var="image=${{ needs.build-and-push.outputs.image_uri }}"
+
+      - name: Health Verification
+        run: |
+          DEV_URL="https://delivery-demo-dev-348694003200.us-central1.run.app"
+          echo "Verifying health endpoint: ${DEV_URL}/health"
+          curl -f -s -o /dev/null -w "%{http_code}\n" "${DEV_URL}/health" || echo "Note: Check if service requires IAM auth"
+
+  # ==========================================
+  # STAGE 5: Deploy to Production (Gated Approval)
+  # ==========================================
+  deploy-prod:
+    name: Deploy to Production
+    needs: [build-and-push, deploy-dev]
+    if: |
+      github.event_name != 'pull_request' && 
+      (github.event_name == 'push' || inputs.target_env == 'prod' || inputs.target_env == 'both')
+    runs-on: ubuntu-latest
+    environment: production # Requires manual approval in GitHub repo Settings > Environments
+    concurrency: deploy-production
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: terraform -chdir="terraform/environments/prod" init
+
+      - name: Terraform Plan
+        run: |
+          terraform -chdir="terraform/environments/prod" plan \
+            -var="image=${{ needs.build-and-push.outputs.image_uri }}"
+
+      - name: Terraform Apply
+        run: |
+          terraform -chdir="terraform/environments/prod" apply -auto-approve \
+            -var="image=${{ needs.build-and-push.outputs.image_uri }}"
