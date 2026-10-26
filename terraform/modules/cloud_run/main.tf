@@ -10,12 +10,12 @@ resource "google_cloud_run_v2_service" "service" {
     timeout                          = "${var.timeout_seconds}s"
     max_instance_request_concurrency = var.concurrency
     labels                           = merge(var.labels, { environment = var.environment })
-
+   
     scaling {
       min_instance_count = var.min_instances
       max_instance_count = var.max_instances
     }
-
+   invoker_iam_disabled = false
     containers {
       image = var.image
 
